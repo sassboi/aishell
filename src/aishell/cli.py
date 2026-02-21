@@ -44,8 +44,14 @@ FAST_TURNS = int(os.environ.get("AI_FAST_TURNS", "4"))
 MODEL_TIMEOUT = {
     "gpt": int(os.environ.get("AI_TIMEOUT_GPT", "45")),
     "claude": int(os.environ.get("AI_TIMEOUT_CLAUDE", "35")),
-    "gemini": int(os.environ.get("AI_TIMEOUT_GEMINI", "35")),
+    "gemini": int(os.environ.get("AI_TIMEOUT_GEMINI", "60")),
     "deepseek": int(os.environ.get("AI_TIMEOUT_DEEPSEEK", "90")),
+}
+MODEL_TIMEOUT_RETRY = {
+    "gpt": int(os.environ.get("AI_RETRY_GPT", "0")),
+    "claude": int(os.environ.get("AI_RETRY_CLAUDE", "0")),
+    "gemini": int(os.environ.get("AI_RETRY_GEMINI", "1")),
+    "deepseek": int(os.environ.get("AI_RETRY_DEEPSEEK", "0")),
 }
 SLASH_COMMANDS = ["/help", "/model", "/usage", "/auth", "/ollama", "/update", "/speed", "/fixnpm", "/setup", "/clear", "/history", "/save", "/smart", "/dryrun", "/exit"]
 SHELL_BUILTINS = {"cd", "pwd"}
@@ -1135,24 +1141,32 @@ def call_model(prompt: str) -> str:
     if not cmd:
         return f"[error] unknown model: {model}"
 
-    try:
-        timeout_s = MODEL_TIMEOUT.get(model, 45)
-        if model == "gpt":
-            # Run in non-interactive mode and explicitly set working directory
-            p = subprocess.run(
-                cmd + ["--cd", os.getcwd(), prompt],
-                text=True,
-                capture_output=True,
-                timeout=timeout_s,
-            )
-        elif model == "deepseek":
-            p = subprocess.run(cmd + [prompt], text=True, capture_output=True, timeout=timeout_s)
-        else:
-            p = subprocess.run(cmd + [prompt], text=True, capture_output=True, timeout=timeout_s)
-    except FileNotFoundError:
-        return f"[error] '{cmd[0]}' not found on PATH."
-    except subprocess.TimeoutExpired:
-        return f"[error] {model} command timed out after {MODEL_TIMEOUT.get(model, 45)} seconds."
+    timeout_s = MODEL_TIMEOUT.get(model, 45)
+    retries = max(0, MODEL_TIMEOUT_RETRY.get(model, 0))
+
+    for attempt in range(retries + 1):
+        try:
+            if model == "gpt":
+                # Run in non-interactive mode and explicitly set working directory
+                p = subprocess.run(
+                    cmd + ["--cd", os.getcwd(), prompt],
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_s,
+                )
+            elif model == "deepseek":
+                p = subprocess.run(cmd + [prompt], text=True, capture_output=True, timeout=timeout_s)
+            else:
+                p = subprocess.run(cmd + [prompt], text=True, capture_output=True, timeout=timeout_s)
+            break
+        except subprocess.TimeoutExpired:
+            if attempt < retries:
+                continue
+            return f"[error] {model} command timed out after {timeout_s} seconds."
+        except FileNotFoundError:
+            return f"[error] '{cmd[0]}' not found on PATH."
+        except Exception as e:
+            return f"[error] {model} command failed: {e}"
 
     out = (p.stdout or "").strip()
     err = (p.stderr or "").strip()
