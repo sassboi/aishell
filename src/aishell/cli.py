@@ -240,7 +240,7 @@ def check_for_updates(force: bool = False):
     state = _read_json(UPDATE_FILE)
     last = int(state.get("last_checked") or 0)
     if not force and (now - last) < 24 * 3600:
-        return
+        return False
 
     current = _current_version()
     latest = ""
@@ -254,7 +254,9 @@ def check_for_updates(force: bool = False):
             UPDATE_FILE.write_text(json.dumps(state), encoding="utf-8")
         except Exception:
             pass
-        return
+        if force:
+            print_status("update", "Could not reach update server.", "33")
+        return False
 
     state["last_checked"] = now
     state["latest_seen"] = latest
@@ -266,6 +268,10 @@ def check_for_updates(force: bool = False):
     if latest and _version_tuple(latest) > _version_tuple(current):
         print_status("update", f"New aishell version available: {latest} (current {current})", "33")
         print_status("update", "Upgrade with: pipx upgrade aishell-terminal", "33")
+        return True
+    if force:
+        print_status("update", f"You are on the latest version ({current}).", "32")
+    return False
 
 def looks_like_usage_exhausted(text: str) -> bool:
     s = (text or "").lower()
