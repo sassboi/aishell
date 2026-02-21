@@ -32,6 +32,7 @@ You can also pass a wheel path:
 ```
 
 The installer can optionally prompt to install provider CLIs (`codex`, `claude`, `gemini`, `ollama`) and will only install each one with explicit user approval.
+If npm global install fails with `EACCES`, installers attempt a user-prefix npm fix (`~/.npm-global`) and retry.
 
 ## Run
 ```bash
@@ -50,6 +51,8 @@ aishell-gui
 - `/auth [model] [status|login|logout]`
 - `/ollama [status|install|uninstall|pull [model]]`
 - `/update`
+- `/speed [fast|balanced]`
+- `/fixnpm`
 - `/setup`
 - `/clear`
 - `/history`

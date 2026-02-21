@@ -47,7 +47,7 @@ MODEL_TIMEOUT = {
     "gemini": int(os.environ.get("AI_TIMEOUT_GEMINI", "35")),
     "deepseek": int(os.environ.get("AI_TIMEOUT_DEEPSEEK", "90")),
 }
-SLASH_COMMANDS = ["/help", "/model", "/usage", "/auth", "/ollama", "/update", "/speed", "/setup", "/clear", "/history", "/save", "/smart", "/dryrun", "/exit"]
+SLASH_COMMANDS = ["/help", "/model", "/usage", "/auth", "/ollama", "/update", "/speed", "/fixnpm", "/setup", "/clear", "/history", "/save", "/smart", "/dryrun", "/exit"]
 SHELL_BUILTINS = {"cd", "pwd"}
 SUBCOMMANDS = {
     "git": [
@@ -189,6 +189,7 @@ AI Shell commands:
   /ollama [action]            Ollama actions: status|install|uninstall|pull [model]
   /update                     Check if a newer aishell version is available
   /speed [fast|balanced]      Prefer lower latency vs richer context
+  /fixnpm                     Fix npm global install EACCES permissions
   /setup                      Re-run model setup/auth wizard
   /clear                      Clear chat context
   /history                    Show current context (truncated)
@@ -387,6 +388,58 @@ def run_ollama_command(action: str, arg: str = ""):
         rc = _run_live(["ollama", "pull", target], shell_mode=False)
         print_status("ollama", "pull complete" if rc == 0 else f"pull failed (exit {rc})", "32" if rc == 0 else "31")
         return
+
+def fix_npm_permissions():
+    if shutil.which("npm") is None:
+        print_status("fixnpm", "npm not found on PATH.", "31")
+        return
+
+    try:
+        p = subprocess.run(["npm", "config", "get", "prefix"], text=True, capture_output=True, timeout=5)
+        prefix = (p.stdout or "").strip()
+    except Exception:
+        prefix = ""
+
+    if prefix and os.path.isdir(prefix) and os.access(prefix, os.W_OK):
+        print_status("fixnpm", f"npm prefix already writable: {prefix}", "32")
+        return
+
+    target = str(Path.home() / ".npm-global")
+    try:
+        Path(target).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print_status("fixnpm", f"failed to create {target}: {e}", "31")
+        return
+
+    rc = subprocess.run(["npm", "config", "set", "prefix", target], cwd=os.getcwd()).returncode
+    if rc != 0:
+        print_status("fixnpm", "failed to set npm prefix", "31")
+        return
+
+    shell_name = Path(os.environ.get("SHELL", "")).name
+    if shell_name == "zsh":
+        rc_file = Path.home() / ".zshrc"
+    elif shell_name == "bash":
+        rc_file = Path.home() / ".bashrc"
+    else:
+        rc_file = Path.home() / ".profile"
+
+    export_line = 'export PATH="$HOME/.npm-global/bin:$PATH"'
+    try:
+        existing = rc_file.read_text(encoding="utf-8") if rc_file.exists() else ""
+        if export_line not in existing:
+            with rc_file.open("a", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(export_line + "\n")
+    except Exception as e:
+        print_status("fixnpm", f"prefix set, but failed to update {rc_file}: {e}", "33")
+        print_status("fixnpm", f"manually add: {export_line}", "33")
+        return
+
+    print_status("fixnpm", f"npm global prefix set to {target}", "32")
+    print_status("fixnpm", f"added PATH export to {rc_file}", "32")
+    print_status("fixnpm", "open a new terminal (or source your shell rc) and retry npm install -g", "34")
 
 def run_auth_command(model_name: str, action: str):
     if model_name == "deepseek":
@@ -1315,6 +1368,8 @@ def main():
                     cfg["speed_mode"] = speed_mode
                     save_config(cfg)
                     print_status("speed", speed_mode, "32" if speed_mode == "fast" else "34")
+            elif cmd == "/fixnpm":
+                fix_npm_permissions()
             elif cmd == "/setup":
                 cfg = run_setup_wizard(cfg)
                 enabled_models = [normalize_model(m) for m in cfg.get("enabled_models", [])]

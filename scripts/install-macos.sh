@@ -36,8 +36,20 @@ install_node_cli() {
   fi
   ensure_npm || return 1
   echo "Installing ${label}..."
+  if npm install -g "$package"; then
+    return 0
+  fi
+
+  echo "Initial install failed; trying npm EACCES permission fix..."
+  mkdir -p "$HOME/.npm-global"
+  npm config set prefix "$HOME/.npm-global" || true
+  if ! grep -q 'npm-global/bin' "$HOME/.zshrc" 2>/dev/null; then
+    echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> "$HOME/.zshrc"
+  fi
+  export PATH="$HOME/.npm-global/bin:$PATH"
+
   npm install -g "$package" || {
-    echo "Failed to install ${label} (${package})."
+    echo "Failed to install ${label} (${package}) after npm permission fix."
     return 1
   }
 }
