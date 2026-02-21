@@ -6,7 +6,8 @@ SRC="${1:-$ROOT_DIR}"
 
 echo "aishell installer"
 echo "Note: Ollama is optional (used for local/offline DeepSeek), large, and is NOT auto-installed."
-echo "Users must explicitly approve/install it later (for example: /ollama install)."
+echo "Provider CLIs (codex/claude/gemini) are auto-installed by default; set AI_INSTALL_CLIS=0 to skip."
+echo "Users must explicitly approve/install Ollama later (for example: /ollama install)."
 echo
 
 case "$(uname -s)" in

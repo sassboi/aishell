@@ -31,7 +31,9 @@ You can also pass a wheel path:
 ./scripts/autoinstall.sh /path/to/aishell_terminal-0.1.0-py3-none-any.whl
 ```
 
-The installer can optionally prompt to install provider CLIs (`codex`, `claude`, `gemini`, `ollama`) and will only install each one with explicit user approval.
+The installer auto-installs provider CLIs (`codex`, `claude`, `gemini`) by default.
+Set `AI_INSTALL_CLIS=0` to skip this auto-install behavior.
+`ollama` remains optional and is installed only with explicit user approval.
 If npm global install fails with `EACCES`, installers attempt a user-prefix npm fix (`~/.npm-global`) and retry.
 
 ## Run

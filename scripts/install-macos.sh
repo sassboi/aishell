@@ -65,26 +65,24 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 SRC="${1:-.}"
+AUTO_INSTALL_CLIS="${AI_INSTALL_CLIS:-1}"
 
 post_install_wizard() {
-  if ask_yes_no "Install optional AI provider CLIs now?" "N"; then
-    if ask_yes_no "Install OpenAI Codex CLI (gpt model)?" "Y"; then
-      install_node_cli "OpenAI Codex CLI" "@openai/codex" "codex" || true
-    fi
-    if ask_yes_no "Install Claude CLI?" "Y"; then
-      install_node_cli "Claude CLI" "@anthropic-ai/claude-code" "claude" || true
-    fi
-    if ask_yes_no "Install Gemini CLI?" "Y"; then
-      install_node_cli "Gemini CLI" "@google/gemini-cli" "gemini" || true
-    fi
-    if ask_yes_no "Install Ollama (for local/offline DeepSeek)?" "N"; then
-      if command -v ollama >/dev/null 2>&1; then
-        echo "Ollama already installed."
-      elif command -v brew >/dev/null 2>&1; then
-        brew install ollama || echo "Failed to install Ollama."
-      else
-        echo "Homebrew not found. Install Ollama manually."
-      fi
+  if [[ "$AUTO_INSTALL_CLIS" == "1" ]]; then
+    echo "Auto-installing provider CLIs: codex, claude, gemini"
+    install_node_cli "OpenAI Codex CLI" "@openai/codex" "codex" || true
+    install_node_cli "Claude CLI" "@anthropic-ai/claude-code" "claude" || true
+    install_node_cli "Gemini CLI" "@google/gemini-cli" "gemini" || true
+  else
+    echo "Skipping provider CLI auto-install (AI_INSTALL_CLIS=${AUTO_INSTALL_CLIS})."
+  fi
+  if ask_yes_no "Install Ollama (for local/offline DeepSeek)?" "N"; then
+    if command -v ollama >/dev/null 2>&1; then
+      echo "Ollama already installed."
+    elif command -v brew >/dev/null 2>&1; then
+      brew install ollama || echo "Failed to install Ollama."
+    else
+      echo "Homebrew not found. Install Ollama manually."
     fi
   fi
 }
