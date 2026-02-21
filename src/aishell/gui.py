@@ -505,7 +505,25 @@ class AIShellGUI:
                 os.remove(screen_image)
             except OSError:
                 pass
+        if cli.looks_like_usage_exhausted(raw):
+            ui(self._append_error, f"{model} may have exhausted plan quota or hit a rate limit.")
+            self.history.append(("user", line))
+            elapsed = time.perf_counter() - started
+            ui(self._append_status, "response-time", f"{elapsed:.3f}s")
+            ui(self._set_locked, False)
+            ui(self._print_prompt)
+            return
+
         suggested_cmd, cleaned = cli.extract_cmd(raw)
+
+        # Handle __SCRIPT__ placeholder: extract code block and save to temp file
+        if suggested_cmd and "__SCRIPT__" in suggested_cmd:
+            script_path, cleaned = cli.extract_code_block(cleaned)
+            if script_path:
+                suggested_cmd = suggested_cmd.replace("__SCRIPT__", script_path)
+            else:
+                ui(self._append_error, "Command references __SCRIPT__ but no code block found.")
+                suggested_cmd = None
 
         if cleaned:
             ui(self._append, cleaned, "assistant")
@@ -524,7 +542,7 @@ class AIShellGUI:
                 ui(self._append_error, "Suggested command contained newlines. Not running.")
             elif self.dryrun_var.get():
                 ui(self._append_status, "dryrun", f"Command suggested (not executed): {suggested_cmd}")
-            elif model == "claude" or self.autorun_cmd_var.get():
+            elif model in ("claude", "gpt") or self.autorun_cmd_var.get():
                 ui(self._append_cmd, suggested_cmd)
                 out = self._run_shell_capture(suggested_cmd)
                 ui(self._append, out, "assistant")
@@ -724,8 +742,43 @@ class AIShellGUI:
         if line == "pwd":
             return self.cwd
 
+        shell = os.environ.get("SHELL", "").strip() or "/bin/bash"
         try:
-            p = subprocess.run(["bash", "-lc", line], cwd=self.cwd, text=True, capture_output=True)
+            syntax = subprocess.run([shell, "-n", "-c", line], cwd=self.cwd, text=True, capture_output=True)
+        except Exception:
+            syntax = None
+
+        if syntax is not None and syntax.returncode != 0:
+            repaired = cli.repair_common_quote_artifact(line)
+            if repaired:
+                try:
+                    repaired_syntax = subprocess.run([shell, "-n", "-c", repaired], cwd=self.cwd, text=True, capture_output=True)
+                except Exception:
+                    repaired_syntax = None
+                if repaired_syntax is not None and repaired_syntax.returncode == 0:
+                    line = repaired
+                else:
+                    msg = (syntax.stderr or syntax.stdout or "shell syntax check failed").strip()
+                    first = msg.splitlines()[0] if msg else "shell syntax check failed"
+                    return f"[blocked] {first}"
+            else:
+                msg = (syntax.stderr or syntax.stdout or "shell syntax check failed").strip()
+                first = msg.splitlines()[0] if msg else "shell syntax check failed"
+                return f"[blocked] {first}"
+
+        if cli.has_missing_inline_code_arg(line):
+            return "[blocked] Refusing incomplete inline-code command (-c missing payload)."
+
+        missing_script = cli.missing_script_file_for_interpreter(line)
+        if missing_script:
+            return f"[blocked] Script not found: {missing_script}"
+
+        mktemp_repaired = cli.repair_mktemp_template_artifact(line)
+        if mktemp_repaired:
+            line = mktemp_repaired
+
+        try:
+            p = subprocess.run([shell, "-lc", line], cwd=self.cwd, text=True, capture_output=True)
         except Exception as exc:
             return f"[shell error] {exc}"
 

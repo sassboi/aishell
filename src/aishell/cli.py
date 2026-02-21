@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import base64
+import hashlib
 import importlib.metadata as importlib_metadata
 import json
 import os
 import re
+import tempfile
 import shlex
 import subprocess
 import shutil
@@ -43,17 +45,17 @@ MAX_TURNS = int(os.environ.get("AI_MAX_TURNS", "12"))
 FAST_TURNS = int(os.environ.get("AI_FAST_TURNS", "4"))
 MODEL_TIMEOUT = {
     "gpt": int(os.environ.get("AI_TIMEOUT_GPT", "45")),
-    "claude": int(os.environ.get("AI_TIMEOUT_CLAUDE", "35")),
+    "claude": int(os.environ.get("AI_TIMEOUT_CLAUDE", "90")),
     "gemini": int(os.environ.get("AI_TIMEOUT_GEMINI", "60")),
     "deepseek": int(os.environ.get("AI_TIMEOUT_DEEPSEEK", "90")),
 }
 MODEL_TIMEOUT_RETRY = {
     "gpt": int(os.environ.get("AI_RETRY_GPT", "0")),
-    "claude": int(os.environ.get("AI_RETRY_CLAUDE", "0")),
+    "claude": int(os.environ.get("AI_RETRY_CLAUDE", "1")),
     "gemini": int(os.environ.get("AI_RETRY_GEMINI", "1")),
     "deepseek": int(os.environ.get("AI_RETRY_DEEPSEEK", "0")),
 }
-SLASH_COMMANDS = ["/help", "/model", "/usage", "/auth", "/ollama", "/update", "/speed", "/fixnpm", "/setup", "/clear", "/history", "/save", "/smart", "/dryrun", "/exit"]
+SLASH_COMMANDS = ["/help", "/model", "/usage", "/auth", "/ollama", "/update", "/speed", "/fixnpm", "/activity", "/setup", "/clear", "/history", "/save", "/smart", "/dryrun", "/exit"]
 SHELL_BUILTINS = {"cd", "pwd"}
 SUBCOMMANDS = {
     "git": [
@@ -126,6 +128,7 @@ def normalize_model(m: str) -> str:
 
 model = normalize_model(DEFAULT_MODEL)
 history = []  # list of (role, text)
+activity_mode = [True]
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 PT_STYLE = None
 if HAVE_PROMPT_TOOLKIT:
@@ -196,6 +199,7 @@ AI Shell commands:
   /update                     Check if a newer aishell version is available
   /speed [fast|balanced]      Prefer lower latency vs richer context
   /fixnpm                     Fix npm global install EACCES permissions
+  /activity [on|off]          Show live backend activity/status lines
   /setup                      Re-run model setup/auth wizard
   /clear                      Clear chat context
   /history                    Show current context (truncated)
@@ -996,6 +1000,102 @@ def save_transcript():
             f.write(f"{r.upper()}: {t}\n\n")
     print(f"[saved] {out}")
 
+def repair_common_quote_artifact(line: str) -> str | None:
+    """
+    Attempt minimal fixes for common LLM command wrapping artifacts.
+    Returns a repaired command string or None when no safe repair is known.
+    """
+    s = (line or "").strip()
+    if not s:
+        return None
+
+    candidates = []
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        inner = s[1:-1].strip()
+        if inner:
+            candidates.append(inner)
+    if s.endswith('"') and s.count('"') % 2 == 1:
+        trimmed = s[:-1].rstrip()
+        if trimmed:
+            candidates.append(trimmed)
+    if s.endswith("'") and s.count("'") % 2 == 1:
+        trimmed = s[:-1].rstrip()
+        if trimmed:
+            candidates.append(trimmed)
+
+    for c in candidates:
+        if c != s:
+            return c
+    return None
+
+def repair_mktemp_template_artifact(line: str) -> str | None:
+    """
+    Fix common BSD mktemp misuse, e.g.:
+      mktemp /tmp/name.XXXXXX.html
+    -> mktemp /tmp/name.XXXXXX
+    """
+    s = (line or "").strip()
+    if not s:
+        return None
+    pattern = r'(mktemp\s+)([\'"]?)(/tmp/[^\s\'"]*?XXXXXX)\.[A-Za-z0-9]+(\2)'
+    repaired = re.sub(pattern, r"\1\2\3\4", s)
+    if repaired != s:
+        return repaired
+    return None
+
+def has_missing_inline_code_arg(line: str) -> bool:
+    """
+    True when command appears to use a `-c` style inline-code flag without payload.
+    Example: `python3 -c`
+    """
+    s = (line or "").strip()
+    if not s:
+        return False
+    try:
+        parts = shlex.split(s)
+    except Exception:
+        return False
+    if len(parts) < 2:
+        return False
+    inline_code_bins = {"python", "python3", "python2", "bash", "zsh", "sh", "node", "ruby", "perl"}
+    if parts[0] not in inline_code_bins:
+        return False
+    for i, tok in enumerate(parts):
+        if tok == "-c" and i == len(parts) - 1:
+            return True
+    return False
+
+def missing_script_file_for_interpreter(line: str) -> str | None:
+    """
+    Returns missing script path when invoking an interpreter with a .py file
+    that does not exist in the current working directory context.
+    """
+    s = (line or "").strip()
+    if not s:
+        return None
+    try:
+        parts = shlex.split(s)
+    except Exception:
+        return None
+    if len(parts) < 2:
+        return None
+    interpreters = {"python", "python2", "python3", "pypy", "pypy3"}
+    if parts[0] not in interpreters:
+        return None
+
+    for tok in parts[1:]:
+        if tok.startswith("-"):
+            continue
+        if tok.endswith(".py"):
+            candidate = os.path.expanduser(tok)
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(os.getcwd(), candidate)
+            if not os.path.exists(candidate):
+                return tok
+            return None
+        break
+    return None
+
 def run_shell(line: str):
     line = line.strip()
     if not line:
@@ -1019,8 +1119,58 @@ def run_shell(line: str):
         print(os.getcwd())
         return
 
-    # Run everything else in a login shell so PATH/aliases work reasonably well
-    subprocess.run(["bash", "-lc", line], cwd=os.getcwd())
+    shell = os.environ.get("SHELL", "").strip() or "/bin/bash"
+    # Block malformed shell; try minimal auto-repair for common LLM quote artifacts.
+    try:
+        syntax = subprocess.run([shell, "-n", "-c", line], cwd=os.getcwd(), text=True, capture_output=True)
+    except Exception:
+        syntax = None
+
+    if syntax is not None and syntax.returncode != 0:
+        repaired = repair_common_quote_artifact(line)
+        if repaired:
+            try:
+                repaired_syntax = subprocess.run(
+                    [shell, "-n", "-c", repaired], cwd=os.getcwd(), text=True, capture_output=True
+                )
+            except Exception:
+                repaired_syntax = None
+            if repaired_syntax is not None and repaired_syntax.returncode == 0:
+                print_status("autofix", "fixed malformed quote in command", "33")
+                line = repaired
+            else:
+                msg = (syntax.stderr or syntax.stdout or "shell syntax check failed").strip()
+                first = msg.splitlines()[0] if msg else "shell syntax check failed"
+                print_status("blocked", first, "31")
+                return
+        else:
+            msg = (syntax.stderr or syntax.stdout or "shell syntax check failed").strip()
+            first = msg.splitlines()[0] if msg else "shell syntax check failed"
+            print_status("blocked", first, "31")
+            return
+
+    if has_missing_inline_code_arg(line):
+        print_status("blocked", "Refusing incomplete inline-code command (-c missing payload).", "31")
+        return
+
+    missing_script = missing_script_file_for_interpreter(line)
+    if missing_script:
+        print_status("blocked", f"Script not found: {missing_script}", "31")
+        return
+
+    mktemp_repaired = repair_mktemp_template_artifact(line)
+    if mktemp_repaired:
+        print_status("autofix", "fixed mktemp template for this shell", "33")
+        line = mktemp_repaired
+
+    # Run everything else in the user's login shell so PATH/aliases match terminal behavior.
+    try:
+        subprocess.run([shell, "-lc", line], cwd=os.getcwd())
+    except KeyboardInterrupt:
+        print()
+        print_status("shell", "interrupted", "33")
+    except Exception as e:
+        print_status("shell", f"error: {e}", "31")
 
 def looks_like_natural_language(line: str) -> bool:
     s = line.strip().lower()
@@ -1114,7 +1264,7 @@ def build_prompt(user_text: str, smart_mode: bool, max_turns: int = MAX_TURNS, f
             "IMPORTANT OUTPUT FORMAT:",
             "If a terminal command would help, include EXACTLY ONE command suggestion in this format:",
             "CMD: <single-line command here>",
-            "Then provide a short explanation.",
+            "Put the CMD: line FIRST, then provide a short explanation.",
             "If no command is needed, do NOT output CMD: at all.",
             "",
             "Rules for CMD:",
@@ -1122,6 +1272,10 @@ def build_prompt(user_text: str, smart_mode: bool, max_turns: int = MAX_TURNS, f
             "- avoid destructive actions (rm, sudo, mv overwriting, etc.) unless explicitly requested",
             "- if potentially destructive, suggest a safer inspection command first (ls, find, rg, git diff, etc.)",
             "- for file/folder search, prefer fast commands (fd/rg) or limit traversal depth (e.g. find . -maxdepth N)",
+            "- for simulations/animations or any multi-line code, output the code in a fenced code block (```python ... ```) and add CMD: python3 __SCRIPT__ on its own line. The system will save the code to a temp file and replace __SCRIPT__ automatically.",
+            "- for simple one-line commands, use CMD: directly as before",
+            "- avoid long-running foreground web servers for previews unless explicitly requested; prefer opening a local HTML file directly",
+            "- on macOS/BSD, do not use mktemp templates with suffixes like /tmp/name.XXXXXX.html; use mktemp -t name or /tmp/name.XXXXXX",
         ]
 
     lines = []
@@ -1143,6 +1297,9 @@ def call_model(prompt: str) -> str:
 
     timeout_s = MODEL_TIMEOUT.get(model, 45)
     retries = max(0, MODEL_TIMEOUT_RETRY.get(model, 0))
+    if activity_mode[0]:
+        print_status("working", f"{model}: dispatching request (timeout={timeout_s}s, retries={retries})", "34")
+        print_status("backend", " ".join(cmd[:3]) + (" ..." if len(cmd) > 3 else ""), "90")
 
     for attempt in range(retries + 1):
         try:
@@ -1161,6 +1318,8 @@ def call_model(prompt: str) -> str:
             break
         except subprocess.TimeoutExpired:
             if attempt < retries:
+                if activity_mode[0]:
+                    print_status("retry", f"{model}: timeout, retry {attempt + 1}/{retries}", "33")
                 continue
             return f"[error] {model} command timed out after {timeout_s} seconds."
         except FileNotFoundError:
@@ -1174,6 +1333,8 @@ def call_model(prompt: str) -> str:
     # In codex exec: progress streams to stderr; final answer goes to stdout.
     if not out and err:
         out = err
+    if activity_mode[0]:
+        print_status("working", f"{model}: response received", "32")
     return out if out else "[no output returned]"
 
 def extract_cmd(text: str):
@@ -1197,6 +1358,50 @@ def extract_cmd(text: str):
     # Remove the CMD line from displayed response
     cleaned = "\n".join([ln for j, ln in enumerate(lines) if j != cmd_line_idx]).strip()
     return cmd, cleaned
+
+_CODE_BLOCK_RE = re.compile(r"```(\w+)?\s*\n(.*?)```", re.DOTALL)
+
+_LANG_EXT = {
+    "python": ".py", "python3": ".py", "py": ".py",
+    "bash": ".sh", "sh": ".sh", "zsh": ".sh",
+    "javascript": ".js", "js": ".js",
+    "ruby": ".rb", "perl": ".pl", "r": ".R",
+}
+
+_LANG_RUNNER = {
+    ".py": "python3",
+    ".sh": "bash",
+    ".js": "node",
+    ".rb": "ruby",
+    ".pl": "perl",
+    ".R": "Rscript",
+}
+
+def extract_code_block(text: str):
+    """
+    Scan AI response for a fenced code block (```lang ... ```).
+    Saves the code to a temp file and returns (temp_file_path, cleaned_text).
+    Returns (None, text) if no code block found.
+    """
+    m = _CODE_BLOCK_RE.search(text)
+    if not m:
+        return None, text
+
+    lang = (m.group(1) or "python").lower()
+    code = m.group(2)
+
+    ext = _LANG_EXT.get(lang, ".py")
+    code_hash = hashlib.md5(code.encode()).hexdigest()[:10]
+    path = os.path.join(tempfile.gettempdir(), f"aishell_script_{code_hash}{ext}")
+
+    with open(path, "w") as f:
+        f.write(code)
+
+    # Remove the code block from displayed text
+    cleaned = text[:m.start()].rstrip() + "\n" + text[m.end():].lstrip()
+    cleaned = cleaned.strip()
+
+    return path, cleaned
 
 def confirm_run(cmd: str) -> bool:
     ans = input(f"\nRun this command? [y/N]  {cmd}\n> ").strip().lower()
@@ -1234,6 +1439,7 @@ def main():
     speed_mode = str(cfg.get("speed_mode", "balanced")).strip().lower()
     if speed_mode not in ("fast", "balanced"):
         speed_mode = "balanced"
+    activity_mode[0] = bool(cfg.get("activity_mode", True))
 
     session = None
     if HAVE_PROMPT_TOOLKIT:
@@ -1384,6 +1590,14 @@ def main():
                     print_status("speed", speed_mode, "32" if speed_mode == "fast" else "34")
             elif cmd == "/fixnpm":
                 fix_npm_permissions()
+            elif cmd == "/activity":
+                if len(parts) != 2 or parts[1] not in ("on", "off"):
+                    print("Usage: /activity [on|off]")
+                else:
+                    activity_mode[0] = (parts[1] == "on")
+                    cfg["activity_mode"] = activity_mode[0]
+                    save_config(cfg)
+                    print_status("activity", "on" if activity_mode[0] else "off", "34")
             elif cmd == "/setup":
                 cfg = run_setup_wizard(cfg)
                 enabled_models = [normalize_model(m) for m in cfg.get("enabled_models", [])]
@@ -1464,7 +1678,20 @@ def main():
             raw = call_model(prompt)
             if looks_like_usage_exhausted(raw):
                 print_status("usage", f"{model} may have exhausted plan quota or hit a rate limit.", "31")
+                elapsed = time.perf_counter() - started
+                print_status("response-time", f"{elapsed:.3f}s", "90")
+                history.append(("user", line))
+                continue
             suggested_cmd, cleaned = extract_cmd(raw)
+
+            # Handle __SCRIPT__ placeholder: extract code block and save to temp file
+            if suggested_cmd and "__SCRIPT__" in suggested_cmd:
+                script_path, cleaned = extract_code_block(cleaned)
+                if script_path:
+                    suggested_cmd = suggested_cmd.replace("__SCRIPT__", script_path)
+                else:
+                    print_status("blocked", "Command references __SCRIPT__ but no code block found.", "31")
+                    suggested_cmd = None
 
             # Print AI response (without CMD line)
             if cleaned:
@@ -1481,7 +1708,7 @@ def main():
                     print_status("blocked", "Suggested command contained newlines. Not running.", "31")
                 elif dryrun:
                     print_status("dryrun", f"Command suggested (not executed): {suggested_cmd}", "33")
-                elif model in ("claude", "gemini"):
+                elif model in ("claude", "gemini", "gpt"):
                     run_shell(suggested_cmd)
                 elif confirm_run(suggested_cmd):
                     run_shell(suggested_cmd)
