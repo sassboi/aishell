@@ -40,7 +40,14 @@ UPDATE_FILE = STATE_DIR / "update.json"
 
 DEFAULT_MODEL = os.environ.get("AI_DEFAULT", "claude")  # claude | gpt | gemini | deepseek
 MAX_TURNS = int(os.environ.get("AI_MAX_TURNS", "12"))
-SLASH_COMMANDS = ["/help", "/model", "/usage", "/auth", "/ollama", "/update", "/setup", "/clear", "/history", "/save", "/smart", "/dryrun", "/exit"]
+FAST_TURNS = int(os.environ.get("AI_FAST_TURNS", "4"))
+MODEL_TIMEOUT = {
+    "gpt": int(os.environ.get("AI_TIMEOUT_GPT", "45")),
+    "claude": int(os.environ.get("AI_TIMEOUT_CLAUDE", "35")),
+    "gemini": int(os.environ.get("AI_TIMEOUT_GEMINI", "35")),
+    "deepseek": int(os.environ.get("AI_TIMEOUT_DEEPSEEK", "90")),
+}
+SLASH_COMMANDS = ["/help", "/model", "/usage", "/auth", "/ollama", "/update", "/speed", "/setup", "/clear", "/history", "/save", "/smart", "/dryrun", "/exit"]
 SHELL_BUILTINS = {"cd", "pwd"}
 SUBCOMMANDS = {
     "git": [
@@ -181,6 +188,7 @@ AI Shell commands:
   /auth [model] [action]      Auth actions: status|login|logout
   /ollama [action]            Ollama actions: status|install|uninstall|pull [model]
   /update                     Check if a newer aishell version is available
+  /speed [fast|balanced]      Prefer lower latency vs richer context
   /setup                      Re-run model setup/auth wizard
   /clear                      Clear chat context
   /history                    Show current context (truncated)
@@ -1029,8 +1037,8 @@ def is_shell_command(line: str) -> bool:
         return True
     return command_exists(first)
 
-def build_prompt(user_text: str, smart_mode: bool) -> str:
-    ctx = history[-2 * MAX_TURNS:]
+def build_prompt(user_text: str, smart_mode: bool, max_turns: int = MAX_TURNS, fast_mode: bool = False) -> str:
+    ctx = history[-2 * max_turns:]
 
     system = [
         "You are an assistant inside a terminal for a PhD workflow.",
@@ -1038,6 +1046,8 @@ def build_prompt(user_text: str, smart_mode: bool) -> str:
         "If you propose terminal commands, prefer safe, non-destructive commands.",
         "Never include secrets or tokens.",
     ]
+    if fast_mode:
+        system.append("Latency mode is FAST: answer briefly and skip long explanations.")
 
     if smart_mode:
         system += [
@@ -1052,6 +1062,7 @@ def build_prompt(user_text: str, smart_mode: bool) -> str:
             "- single line only (no newlines)",
             "- avoid destructive actions (rm, sudo, mv overwriting, etc.) unless explicitly requested",
             "- if potentially destructive, suggest a safer inspection command first (ls, find, rg, git diff, etc.)",
+            "- for file/folder search, prefer fast commands (fd/rg) or limit traversal depth (e.g. find . -maxdepth N)",
         ]
 
     lines = []
@@ -1072,22 +1083,23 @@ def call_model(prompt: str) -> str:
         return f"[error] unknown model: {model}"
 
     try:
+        timeout_s = MODEL_TIMEOUT.get(model, 45)
         if model == "gpt":
             # Run in non-interactive mode and explicitly set working directory
             p = subprocess.run(
                 cmd + ["--cd", os.getcwd(), prompt],
                 text=True,
                 capture_output=True,
-                timeout=45,
+                timeout=timeout_s,
             )
         elif model == "deepseek":
-            p = subprocess.run(cmd + [prompt], text=True, capture_output=True)
+            p = subprocess.run(cmd + [prompt], text=True, capture_output=True, timeout=timeout_s)
         else:
-            p = subprocess.run(cmd + [prompt], text=True, capture_output=True)
+            p = subprocess.run(cmd + [prompt], text=True, capture_output=True, timeout=timeout_s)
     except FileNotFoundError:
         return f"[error] '{cmd[0]}' not found on PATH."
     except subprocess.TimeoutExpired:
-        return "[error] gpt command timed out after 45 seconds."
+        return f"[error] {model} command timed out after {MODEL_TIMEOUT.get(model, 45)} seconds."
 
     out = (p.stdout or "").strip()
     err = (p.stderr or "").strip()
@@ -1152,6 +1164,9 @@ def main():
 
     smart_mode = True
     dryrun = False
+    speed_mode = str(cfg.get("speed_mode", "balanced")).strip().lower()
+    if speed_mode not in ("fast", "balanced"):
+        speed_mode = "balanced"
 
     session = None
     if HAVE_PROMPT_TOOLKIT:
@@ -1292,6 +1307,14 @@ def main():
                 run_ollama_command(action, arg)
             elif cmd == "/update":
                 check_for_updates(force=True)
+            elif cmd == "/speed":
+                if len(parts) != 2 or parts[1] not in ("fast", "balanced"):
+                    print("Usage: /speed [fast|balanced]")
+                else:
+                    speed_mode = parts[1]
+                    cfg["speed_mode"] = speed_mode
+                    save_config(cfg)
+                    print_status("speed", speed_mode, "32" if speed_mode == "fast" else "34")
             elif cmd == "/setup":
                 cfg = run_setup_wizard(cfg)
                 enabled_models = [normalize_model(m) for m in cfg.get("enabled_models", [])]
@@ -1309,11 +1332,15 @@ def main():
                         cfg["default_model"] = model
                         save_config(cfg)
                         print_status("model", f"deepseek unavailable (ollama missing), switched to {model}", "33")
+                speed_mode = str(cfg.get("speed_mode", speed_mode)).strip().lower()
+                if speed_mode not in ("fast", "balanced"):
+                    speed_mode = "balanced"
             elif cmd == "/clear":
                 history = []
                 print_status("cleared", "chat context", "34")
             elif cmd == "/history":
-                ctx = history[-2 * MAX_TURNS:]
+                turns = FAST_TURNS if speed_mode == "fast" else MAX_TURNS
+                ctx = history[-2 * turns:]
                 if not ctx:
                     print("[empty]")
                 else:
@@ -1358,7 +1385,13 @@ def main():
                 print_status("response-time", f"{elapsed:.3f}s", "90")
                 continue
             explanation_first = should_prefer_explanation(line)
-            prompt = build_prompt(line, smart_mode=(smart_mode and not explanation_first))
+            turns = FAST_TURNS if speed_mode == "fast" else MAX_TURNS
+            prompt = build_prompt(
+                line,
+                smart_mode=(smart_mode and not explanation_first),
+                max_turns=turns,
+                fast_mode=(speed_mode == "fast"),
+            )
             raw = call_model(prompt)
             if looks_like_usage_exhausted(raw):
                 print_status("usage", f"{model} may have exhausted plan quota or hit a rate limit.", "31")

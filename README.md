@@ -31,6 +31,8 @@ You can also pass a wheel path:
 ./scripts/autoinstall.sh /path/to/aishell_terminal-0.1.0-py3-none-any.whl
 ```
 
+The installer can optionally prompt to install provider CLIs (`codex`, `claude`, `gemini`, `ollama`) and will only install each one with explicit user approval.
+
 ## Run
 ```bash
 aishell
