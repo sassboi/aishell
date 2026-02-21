@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aishell-terminal"
+version = "0.1.0"
+description = "AI-assisted terminal shell with multi-model routing for macOS and Ubuntu Linux"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "aishell contributors"}]
+license = {text = "MIT"}
+keywords = ["terminal", "ai", "shell", "cli"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+  "prompt_toolkit>=3.0.0",
+]
+
+[project.scripts]
+aishell = "aishell.cli:main"
+aishell-gui = "aishell.gui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
